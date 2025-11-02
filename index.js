@@ -1,0 +1,398 @@
+const fs = require('fs');
+const path = require('path');
+const { default: makeWASocket, useSingleFileAuthState, fetchLatestBaileysVersion, DisconnectReason } = require('@whiskeysockets/baileys');
+const pino = require('pino');
+const qrcode = require('qrcode-terminal');
+
+// Use multi-file auth state (v7+ of baileys)
+// We'll initialize this inside startBot() because useMultiFileAuthState is async
+// and returns { state, saveCreds }.
+
+const CONFIG_PATH = path.join(__dirname, 'bot_config.json');
+
+function loadConfig() {
+  try {
+    if (!fs.existsSync(CONFIG_PATH)) {
+      const defaultConfig = {
+        mode: 'online', // 'online' | 'offline' | 'busy' (treat 'busy' same as 'online')
+        ownerName: 'Nama',
+        whitelist: [],
+        blacklist: [],
+        adminNumbers: [],
+          suppressWhenOwnerActive: false,
+          suppressTimeoutSeconds: 120,
+      autoReply: true,
+      replyCooldownSeconds: 3600
+      };
+      fs.writeFileSync(CONFIG_PATH, JSON.stringify(defaultConfig, null, 2));
+      return defaultConfig;
+    }
+    const raw = fs.readFileSync(CONFIG_PATH, 'utf8');
+    return JSON.parse(raw);
+    } catch (e) {
+    console.error('Failed to load config, using defaults', e);
+    return { mode: 'online', ownerName: 'Nama', whitelist: [], blacklist: [], adminNumbers: [], suppressWhenOwnerActive: false, suppressTimeoutSeconds: 120, autoReply: true, replyCooldownSeconds: 3600 };
+  }
+}
+
+function saveConfig(cfg) {
+  try {
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+  } catch (e) {
+    console.error('Failed to save config', e);
+  }
+}
+
+let config = loadConfig();
+
+function jidToNumber(jid) {
+  if (!jid) return null;
+  return jid.split('@')[0];
+}
+
+async function startBot() {
+  try {
+    // Fetch latest WA Web protocol version
+    const { version } = await fetchLatestBaileysVersion();
+
+    // initialize multi-file auth state in ./auth_info
+    const { useMultiFileAuthState } = require('@whiskeysockets/baileys');
+    const { state, saveCreds } = await useMultiFileAuthState(path.join(__dirname, 'auth_info'));
+
+    const sock = makeWASocket({
+      logger: pino({ level: 'silent' }),
+      printQRInTerminal: true,
+      auth: state,
+      version
+    });
+
+    // save auth creds when updated
+    sock.ev.on('creds.update', saveCreds);
+
+    // connection updates (qr, open, close)
+    sock.ev.on('connection.update', (update) => {
+      const { connection, lastDisconnect, qr } = update;
+      if (qr) {
+        // show QR in terminal for initial login
+        qrcode.generate(qr, { small: true });
+        console.log('QR code generated - scan with WhatsApp');
+      }
+
+      if (connection === 'open') {
+        console.log('✅ Connected to WhatsApp');
+        // update ownerName from session if available
+        try {
+          const me = state.creds?.me;
+          if (me && me.name && (!config.ownerName || config.ownerName === 'Nama')) {
+            config.ownerName = me.name;
+            saveConfig(config);
+          }
+        } catch (e) {
+          // ignore
+        }
+      }
+
+      if (connection === 'close') {
+        const reason = lastDisconnect?.error?.output?.statusCode;
+        console.log('Connection closed, status code:', reason);
+        // if logged out, stop; otherwise try reconnecting
+        if (reason !== DisconnectReason.loggedOut) {
+          console.log('Reconnecting...');
+          startBot();
+        } else {
+          console.log('Logged out. Delete auth_info.json and re-run to re-authenticate.');
+        }
+      }
+    });
+
+      // ownerJid and presence tracking for suppression
+      let ownerJid = undefined;
+      try {
+        ownerJid = state.creds?.me?.id || (state.creds?.me && `${state.creds.me?.user}@s.whatsapp.net`);
+        if (ownerJid) console.log('Owner JID:', ownerJid);
+      } catch (e) {
+        // ignore
+      }
+
+      let lastOwnerActive = 0; // timestamp ms of last owner activity
+
+    // simple per-number cooldown map (avoid spam replies)
+    const lastReplyAt = new Map();
+
+      // listen for presence updates; shape varies across versions
+      sock.ev.on('presence.update', (update) => {
+        try {
+          const now = Date.now();
+          if (!update) return;
+          if (update.id && ownerJid && update.id === ownerJid) {
+            lastOwnerActive = now;
+            if (config.suppressWhenOwnerActive) console.log('Presence detected for owner, updated lastOwnerActive');
+            return;
+          }
+          if (typeof update === 'object') {
+            const keys = Object.keys(update);
+            for (const k of keys) {
+              if (k === ownerJid || k === (ownerJid?.split('@')[0])) {
+                lastOwnerActive = now;
+                if (config.suppressWhenOwnerActive) console.log('Presence mapping contains owner, updated lastOwnerActive');
+                return;
+              }
+            }
+          }
+        } catch (e) {
+          // ignore
+        }
+      });
+
+    // Handle incoming messages
+    sock.ev.on('messages.upsert', async (m) => {
+      try {
+        const messages = m.messages;
+        if (!messages || messages.length === 0) return;
+        const msg = messages[0];
+        // Ignore status messages or messages without content
+        if (!msg.message) return;
+
+        const from = msg.key.remoteJid;
+        // Only reply to private chats (not groups). Group JIDs end with @g.us
+        if (!from || from.endsWith('@g.us')) return;
+
+        // Don't reply to our own sent messages (prevent loops)
+        if (msg.key.fromMe) return;
+
+        // Extract text content (support different message shapes)
+        const getText = () => {
+          const message = msg.message;
+          if (message.conversation) return message.conversation;
+          if (message.extendedTextMessage && message.extendedTextMessage.text) return message.extendedTextMessage.text;
+          if (message.imageMessage && message.imageMessage.caption) return message.imageMessage.caption;
+          if (message.videoMessage && message.videoMessage.caption) return message.videoMessage.caption;
+          return '';
+        };
+
+        const text = (getText() || '').trim();
+        const remoteNumber = jidToNumber(from);
+        console.log('Incoming message from', remoteNumber, '-', text);
+
+        // Admin commands: only from configured adminNumbers
+        const isAdmin = config.adminNumbers.includes(remoteNumber);
+        if (isAdmin && text.startsWith('!')) {
+          const parts = text.slice(1).trim().split(/\s+/);
+          const cmd = parts[0]?.toLowerCase();
+          const args = parts.slice(1);
+
+          if (cmd === 'status') {
+            const val = (args[0] || '').toLowerCase();
+            if (['online', 'offline', 'busy'].includes(val)) {
+              config.mode = val;
+              saveConfig(config);
+              await sock.sendMessage(from, { text: `✅ Mode berhasil diubah menjadi: ${val}` });
+            } else {
+              await sock.sendMessage(from, { text: 'Gunakan: !status online|offline|busy' });
+            }
+            return;
+          }
+
+          if (cmd === 'whitelist') {
+            const sub = args[0];
+            const num = args[1];
+            if (sub === 'add' && num) {
+              if (!config.whitelist.includes(num)) config.whitelist.push(num);
+              saveConfig(config);
+              await sock.sendMessage(from, { text: `➕ Nomor ${num} berhasil ditambahkan ke whitelist.` });
+            } else if (sub === 'remove' && num) {
+              config.whitelist = config.whitelist.filter(n => n !== num);
+              saveConfig(config);
+              await sock.sendMessage(from, { text: `➖ Nomor ${num} dihapus dari whitelist.` });
+            } else {
+              await sock.sendMessage(from, { text: 'Gunakan: !whitelist add|remove <nomor>' });
+            }
+            return;
+          }
+
+          if (cmd === 'blacklist') {
+            const sub = args[0];
+            const num = args[1];
+            if (sub === 'add' && num) {
+              if (!config.blacklist.includes(num)) config.blacklist.push(num);
+              saveConfig(config);
+              await sock.sendMessage(from, { text: `⛔ Nomor ${num} berhasil ditambahkan ke blacklist.` });
+            } else if (sub === 'remove' && num) {
+              config.blacklist = config.blacklist.filter(n => n !== num);
+              saveConfig(config);
+              await sock.sendMessage(from, { text: `✔️ Nomor ${num} telah dihapus dari blacklist.` });
+            } else {
+              await sock.sendMessage(from, { text: 'Gunakan: !blacklist add|remove <nomor>' });
+            }
+            return;
+          }
+
+          if (cmd === 'show') {
+            await sock.sendMessage(from, { text: `📋 Config saat ini:\n• mode: ${config.mode}\n• ownerName: ${config.ownerName}\n• whitelist: ${config.whitelist.join(', ') || '-'}\n• blacklist: ${config.blacklist.join(', ') || '-'}\n• adminNumbers: ${config.adminNumbers.join(', ') || '-'}\n• suppressWhenOwnerActive: ${config.suppressWhenOwnerActive}\n• suppressTimeoutSeconds: ${config.suppressTimeoutSeconds}` });
+            return;
+          }
+
+          if (cmd === 'admin') {
+            const sub = args[0];
+            const num = args[1];
+            if (sub === 'add' && num) {
+              if (!config.adminNumbers.includes(num)) config.adminNumbers.push(num);
+              saveConfig(config);
+              await sock.sendMessage(from, { text: `🔐 Nomor ${num} berhasil ditambahkan sebagai admin.` });
+            } else if (sub === 'remove' && num) {
+              config.adminNumbers = config.adminNumbers.filter(n => n !== num);
+              saveConfig(config);
+              await sock.sendMessage(from, { text: `🔓 Nomor ${num} telah dihapus dari admin.` });
+            } else {
+              await sock.sendMessage(from, { text: 'Gunakan: !admin add|remove <nomor>' });
+            }
+            return;
+          }
+
+          if (cmd === 'suppress') {
+            const sub = args[0];
+            if (!sub) {
+              await sock.sendMessage(from, { text: 'Gunakan: !suppress on|off OR !suppress timeout <seconds>' });
+              return;
+            }
+            if (sub === 'on' || sub === 'off') {
+              config.suppressWhenOwnerActive = (sub === 'on');
+              saveConfig(config);
+              await sock.sendMessage(from, { text: `🔕 suppressWhenOwnerActive sudah ${config.suppressWhenOwnerActive ? 'ON' : 'OFF'}` });
+              return;
+            }
+            if (sub === 'timeout') {
+              const sec = parseInt(args[1] || '', 10);
+              if (!isNaN(sec) && sec >= 0) {
+                config.suppressTimeoutSeconds = sec;
+                saveConfig(config);
+                await sock.sendMessage(from, { text: `⏱️ suppressTimeoutSeconds diset ke ${sec} detik` });
+              } else {
+                await sock.sendMessage(from, { text: 'Gunakan: !suppress timeout <seconds> (contoh: !suppress timeout 120)' });
+              }
+              return;
+            }
+            await sock.sendMessage(from, { text: 'Perintah suppress tidak dikenali. Gunakan on|off atau timeout.' });
+            return;
+          }
+
+          if (cmd === 'autoreply') {
+            const val = (args[0] || '').toLowerCase();
+            if (val === 'on' || val === 'off') {
+              config.autoReply = (val === 'on');
+              saveConfig(config);
+              await sock.sendMessage(from, { text: `🔁 Auto-reply sekarang: ${config.autoReply ? 'ON' : 'OFF'}` });
+            } else {
+              await sock.sendMessage(from, { text: 'Gunakan: !autoreply on|off' });
+            }
+            return;
+          }
+
+          if (cmd === 'cooldown') {
+            const sec = parseInt(args[0] || '', 10);
+            if (!isNaN(sec) && sec >= 0) {
+              config.replyCooldownSeconds = sec;
+              saveConfig(config);
+              await sock.sendMessage(from, { text: `⏱️ cooldown reply diset ke ${sec} detik` });
+            } else {
+              await sock.sendMessage(from, { text: 'Gunakan: !cooldown <seconds> (contoh: !cooldown 60)' });
+            }
+            return;
+          }
+
+          await sock.sendMessage(from, { text: 'Perintah admin tidak dikenali. Ketik !show untuk melihat konfigurasi saat ini.' });
+          return;
+        }
+
+        // Blacklist handling
+        if (config.blacklist.includes(remoteNumber)) {
+          console.log('Sender in blacklist, ignoring:', remoteNumber);
+          return;
+        }
+
+        // Whitelist handling: if whitelist non-empty, only respond to those in whitelist
+        if (config.whitelist.length > 0 && !config.whitelist.includes(remoteNumber)) {
+          console.log('Sender not in whitelist, ignoring:', remoteNumber);
+          return;
+        }
+
+        // If suppressWhenOwnerActive is enabled and owner was recently active, skip auto-reply
+        if (config.suppressWhenOwnerActive) {
+          try {
+            const now = Date.now();
+            const since = now - (lastOwnerActive || 0);
+            const timeoutMs = (config.suppressTimeoutSeconds || 120) * 1000;
+            if (lastOwnerActive && since <= timeoutMs) {
+              console.log(`Owner active recently (${Math.round(since/1000)}s ago) — suppressing auto-reply to ${remoteNumber}`);
+              return;
+            }
+          } catch (e) {
+            // ignore suppression errors
+          }
+        }
+
+        // If autoReply disabled, do not send automatic replies to normal users
+        if (!config.autoReply) {
+          console.log('Auto-reply disabled, ignoring message from', remoteNumber);
+          return;
+        }
+
+        // rate limit (per-number cooldown)
+        try {
+          const now = Date.now();
+          const last = lastReplyAt.get(remoteNumber) || 0;
+          const cooldownMs = (config.replyCooldownSeconds || 60) * 1000;
+          if (now - last < cooldownMs) {
+            console.log(`Skipping reply due cooldown for ${remoteNumber} (wait ${Math.ceil((cooldownMs - (now-last))/1000)}s)`);
+            return;
+          }
+          // mark last replied
+          lastReplyAt.set(remoteNumber, now);
+        } catch (e) {
+          // ignore cooldown errors
+        }
+
+        // Generate reply depending on mode (more friendly phrasing) and time of day
+        const owner = config.ownerName || 'Pemilik';
+
+        function getTimeGreeting() {
+          // Use server/local timezone. Returns Indonesian greeting based on hour.
+          const hr = new Date().getHours();
+          if (hr >= 4 && hr < 10) return 'Selamat pagi';
+          if (hr >= 10 && hr < 15) return 'Selamat siang';
+          if (hr >= 15 && hr < 18) return 'Selamat sore';
+          return 'Selamat malam';
+        }
+
+        const timeGreet = getTimeGreeting();
+        let reply = `${timeGreet} 👋\nTerima kasih sudah menghubungi ${owner}. Saya adalah asisten virtual ${owner}.`;
+        const lower = text.toLowerCase();
+        if (lower.includes('halo') || lower.includes('hi') || lower.includes('hello') || lower.includes('selamat')) {
+          reply = `${timeGreet} 👋! Terima kasih sudah menyapa. Pesan Anda sudah diterima oleh ${owner}.`;
+        } else if (lower.includes('terima kasih') || lower.includes('thanks')) {
+          reply = `Sama-sama 😊 Senang bisa membantu.`;
+        }
+
+        if (config.mode === 'online' || config.mode === 'busy') {
+          // When owner is online but busy — use friendlier, multi-line template
+          reply = `Hai, ${timeGreet} 👋\nSaya adalah asisten virtual milik ${owner}.\nSaat ini ${owner} sedang sibuk, mohon ditunggu beberapa saat hingga beliau dapat membalas pesan Anda.\nTerima kasih atas perhatian dan pengertiannya 🙏`;
+        } else if (config.mode === 'offline') {
+          // When owner is offline (friendly multiline template)
+          reply = `${timeGreet} 👋\nMohon maaf, *${owner}* saat ini sedang tidak aktif.\nSilakan tinggalkan pesan, dan *${owner}* akan membalasnya setelah kembali online.\nTerima kasih atas pengertian dan kesabarannya 🙏`;
+        }
+
+        // Send reply
+        await sock.sendMessage(from, { text: reply });
+        console.log('Replied to', remoteNumber, 'mode:', config.mode);
+
+      } catch (err) {
+        console.error('Error handling message:', err);
+      }
+    });
+
+  } catch (err) {
+    console.error('Failed to start bot:', err);
+  }
+}
+
+startBot();

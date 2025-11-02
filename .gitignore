@@ -1,0 +1,3 @@
+# ignore auth file
+auth_info.json
+node_modules/

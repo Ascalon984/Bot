@@ -1,0 +1,16 @@
+{
+  "name": "botwa-autoreply",
+  "version": "1.0.0",
+  "description": "Bot WhatsApp sederhana untuk membalas pesan pribadi secara otomatis menggunakan Baileys.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@whiskeysockets/baileys": "*",
+    "pino": "^8.0.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
