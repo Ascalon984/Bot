@@ -55,9 +55,17 @@ async function startBot() {
     // Fetch latest WA Web protocol version
     const { version } = await fetchLatestBaileysVersion();
 
-    // initialize multi-file auth state in ./auth_info
+    // initialize multi-file auth state. Allow overriding path with AUTH_DIR env var
     const { useMultiFileAuthState } = require('@whiskeysockets/baileys');
-    const { state, saveCreds } = await useMultiFileAuthState(path.join(__dirname, 'auth_info'));
+    const authDir = process.env.AUTH_DIR ? path.resolve(process.env.AUTH_DIR) : path.join(__dirname, 'auth_info');
+    try {
+      // ensure directory exists (useful when mounting an empty volume)
+      fs.mkdirSync(authDir, { recursive: true });
+    } catch (e) {
+      // ignore mkdir errors - useMultiFileAuthState will report if needed
+    }
+    console.log('Using auth directory:', authDir);
+    const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
     const sock = makeWASocket({
       logger: pino({ level: 'silent' }),
