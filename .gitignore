@@ -1,3 +1,8 @@
-# ignore auth file
+# ignore auth/session files (sensitive!)
+auth_info/
+auth_info/*
 auth_info.json
+replied.json
 node_modules/
+npm-debug.log
+package-lock.json
