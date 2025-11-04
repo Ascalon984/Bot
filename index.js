@@ -219,7 +219,40 @@ async function startBot() {
         }
       });
 
-    // Handle incoming messages
+    // Track admin activity from outgoing messages
+    sock.ev.on('messages.upsert', async (m) => {
+      try {
+        const messages = m.messages;
+        if (!messages || messages.length === 0) return;
+        
+        // Check if any message is from owner (admin) - update lastOwnerActive
+        for (const msg of messages) {
+          if (msg.key && msg.key.fromMe) {
+            lastOwnerActive = Date.now();
+            console.log('Admin sent message - updated lastOwnerActive');
+          }
+        }
+      } catch (e) {
+        // ignore
+      }
+    });
+
+    // Track when admin reads messages
+    sock.ev.on('messages.update', async (updates) => {
+      try {
+        for (const update of updates) {
+          // if message status changed to 'read' or has readTimestamp
+          if (update.update?.status === 4 || update.update?.status === 'read' || update.key?.fromMe) {
+            lastOwnerActive = Date.now();
+            console.log('Admin read message - updated lastOwnerActive');
+          }
+        }
+      } catch (e) {
+        // ignore
+      }
+    });
+
+    // Handle incoming messages for auto-reply
     sock.ev.on('messages.upsert', async (m) => {
       try {
         const messages = m.messages;
@@ -447,33 +480,59 @@ async function startBot() {
           return;
         }
 
-        // Assist logic: if owner is online but idle (not actively viewing), offer quick-help buttons
+        // Assist logic: if owner is online but idle (not actively viewing), decide whether to reply
+        let shouldReply = true;
+        let useButtons = false;
+        
         try {
           const nowMs = Date.now();
           const adminOnline = !!ownerOnline;
           const adminIdle = ((nowMs - (lastOwnerActive || 0)) / 1000) > OWNER_IDLE_SECONDS;
           const assistCooldown = (config.assistCooldownSeconds || 3600);
-          const st = assistState.bySender[remoteNumber] || { assistEnabled: true, lastDeniedAt: 0 };
+          const st = assistState.bySender[remoteNumber] || { assistEnabled: true, lastDeniedAt: 0, lastRepliedMsgId: null };
+
+          console.log(`Assist check: adminOnline=${adminOnline}, adminIdle=${adminIdle}, idleSeconds=${Math.round((nowMs - lastOwnerActive)/1000)}, threshold=${OWNER_IDLE_SECONDS}`);
 
           if (adminOnline && adminIdle) {
+            // Check if we already replied to this exact message
+            if (st.lastRepliedMsgId === msg.key.id) {
+              console.log('Already replied to this message ID for', remoteNumber, '- skipping');
+              return;
+            }
+
             // if sender explicitly disabled assist and still in cooldown, skip
             if (st.assistEnabled === false && st.lastDeniedAt && ((nowMs - st.lastDeniedAt) / 1000) < assistCooldown) {
               console.log('Assist disabled for', remoteNumber, 'and still in cooldown — skipping reply');
               return;
             }
 
-            // If assist enabled (user previously said Iya), proceed to normal reply below
-            if (st.assistEnabled !== false) {
-              // we'll continue to send reply (and also include buttons the first time)
+            // If assist enabled (user previously said Iya), proceed with normal reply
+            if (st.assistEnabled === true) {
+              shouldReply = true;
+              useButtons = false;
             } else {
-              // assist disabled but cooldown expired — show buttons again (fallthrough)
+              // First time or cooldown expired - show buttons
+              shouldReply = true;
+              useButtons = true;
             }
+          } else {
+            // Admin is not online+idle - use normal auto-reply behavior
+            shouldReply = true;
+            useButtons = false;
           }
+
+          // Store state
+          assistState.bySender[remoteNumber] = st;
         } catch (e) {
-          // ignore assist errors
+          console.error('Assist logic error:', e);
+          // ignore assist errors, fallback to normal reply
         }
 
-        // rate limit (per-number cooldown)
+        if (!shouldReply) {
+          return;
+        }
+
+        // rate limit (per-number cooldown) - CHECK BEFORE replying
         try {
           const now = Date.now();
           const last = lastReplyAt.get(remoteNumber) || 0;
@@ -482,8 +541,6 @@ async function startBot() {
             console.log(`Skipping reply due cooldown for ${remoteNumber} (wait ${Math.ceil((cooldownMs - (now-last))/1000)}s)`);
             return;
           }
-          // mark last replied
-          lastReplyAt.set(remoteNumber, now);
         } catch (e) {
           // ignore cooldown errors
         }
@@ -517,53 +574,43 @@ async function startBot() {
           reply = `${timeGreet} 👋\nMohon maaf, *${owner}* saat ini sedang tidak aktif.\nSilakan tinggalkan pesan, dan *${owner}* akan membalasnya setelah kembali online.\nTerima kasih atas pengertian dan kesabarannya 🙏`;
         }
 
-        // Send reply (consider assist state / buttons when owner is online but idle)
+        // Send reply
         try {
-          const nowMs = Date.now();
-          const adminOnline = !!ownerOnline;
-          const adminIdle = ((nowMs - (lastOwnerActive || 0)) / 1000) > OWNER_IDLE_SECONDS;
-          const assistCooldown = (config.assistCooldownSeconds || 3600);
-          const st = assistState.bySender[remoteNumber] || { assistEnabled: true, lastDeniedAt: 0 };
+          const st = assistState.bySender[remoteNumber] || { assistEnabled: true, lastDeniedAt: 0, lastRepliedMsgId: null };
 
-          if (adminOnline && adminIdle) {
-            // if sender disabled assist and still in cooldown, skip replying
-            if (st.assistEnabled === false && st.lastDeniedAt && ((nowMs - st.lastDeniedAt) / 1000) < assistCooldown) {
-              console.log('Assist disabled for', remoteNumber, 'and still in cooldown — skipping reply');
-              return;
-            }
-
-            if (st.assistEnabled === true) {
-              // user opted in: normal text reply
-              await sock.sendMessage(from, { text: reply });
-            } else {
-              // ask user if they are helped (buttons) and do not repeatedly spam - include footer and two buttons
-              const buttons = [
-                { buttonId: 'assist_yes', buttonText: { displayText: 'Iya' }, type: 1 },
-                { buttonId: 'assist_no', buttonText: { displayText: 'Tidak' }, type: 1 }
-              ];
-              const buttonMessage = {
-                text: reply,
-                footerText: 'Apakah Terbantu?',
-                buttons,
-                headerType: 1
-              };
-              await sock.sendMessage(from, buttonMessage);
-            }
+          if (useButtons) {
+            // ask user if they are helped (buttons)
+            const buttons = [
+              { buttonId: 'assist_yes', buttonText: { displayText: 'Iya' }, type: 1 },
+              { buttonId: 'assist_no', buttonText: { displayText: 'Tidak' }, type: 1 }
+            ];
+            const buttonMessage = {
+              text: reply,
+              footerText: 'Apakah Terbantu?',
+              buttons,
+              headerType: 1
+            };
+            await sock.sendMessage(from, buttonMessage);
           } else {
-            // normal behavior when owner not online+idle
+            // normal text reply
             await sock.sendMessage(from, { text: reply });
           }
+
+          // NOW mark cooldown AFTER successful send
+          lastReplyAt.set(remoteNumber, Date.now());
 
           // mark this message as replied (persist so we don't reply again to same message)
           try {
             repliedSet.add(messageKey);
             saveReplied();
+            // Also store in assist state
+            st.lastRepliedMsgId = msg.key.id;
+            assistState.bySender[remoteNumber] = st;
+            saveAssistState();
           } catch (e) {
             // ignore save errors
           }
-          // persist assist state if updated
-          try { assistState.bySender[remoteNumber] = st; saveAssistState(); } catch(e){}
-          console.log('Replied to', remoteNumber, 'mode:', config.mode);
+          console.log('Replied to', remoteNumber, 'mode:', config.mode, 'buttons:', useButtons);
         } catch (e) {
           console.error('Failed to send reply:', e);
         }
