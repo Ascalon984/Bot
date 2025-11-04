@@ -219,24 +219,6 @@ async function startBot() {
         }
       });
 
-    // Track admin activity from outgoing messages
-    sock.ev.on('messages.upsert', async (m) => {
-      try {
-        const messages = m.messages;
-        if (!messages || messages.length === 0) return;
-        
-        // Check if any message is from owner (admin) - update lastOwnerActive
-        for (const msg of messages) {
-          if (msg.key && msg.key.fromMe) {
-            lastOwnerActive = Date.now();
-            console.log('Admin sent message - updated lastOwnerActive');
-          }
-        }
-      } catch (e) {
-        // ignore
-      }
-    });
-
     // Track when admin reads messages
     sock.ev.on('messages.update', async (updates) => {
       try {
@@ -252,11 +234,21 @@ async function startBot() {
       }
     });
 
-    // Handle incoming messages for auto-reply
+    // Handle incoming messages - UNIFIED handler (track admin activity + auto-reply)
     sock.ev.on('messages.upsert', async (m) => {
       try {
         const messages = m.messages;
         if (!messages || messages.length === 0) return;
+        
+        // First pass: track admin outgoing messages
+        for (const message of messages) {
+          if (message.key && message.key.fromMe) {
+            lastOwnerActive = Date.now();
+            console.log('Admin sent message - updated lastOwnerActive');
+          }
+        }
+        
+        // Second pass: handle incoming for auto-reply (only first message)
         const msg = messages[0];
         // Ignore status messages or messages without content
         if (!msg.message) return;
@@ -268,6 +260,22 @@ async function startBot() {
         // Don't reply to our own sent messages (prevent loops)
         if (msg.key.fromMe) return;
 
+        // Extract remote number early for self-chat check
+        const remoteNumber = jidToNumber(from);
+        
+        // CRITICAL: Skip self-chat - if user is messaging themselves
+        const ownerJid = config.adminNumbers && config.adminNumbers[0] ? `${config.adminNumbers[0]}@s.whatsapp.net` : null;
+        const ownerNumber = config.adminNumbers && config.adminNumbers[0] ? config.adminNumbers[0] : null;
+        
+        if (ownerJid && from === ownerJid) {
+          console.log('Skipping self-chat message from owner JID:', from);
+          return;
+        }
+        if (ownerNumber && remoteNumber === ownerNumber) {
+          console.log('Skipping self-chat message from owner number:', remoteNumber);
+          return;
+        }
+
         // Extract text content (support different message shapes)
         const getText = () => {
           const message = msg.message;
@@ -278,8 +286,7 @@ async function startBot() {
           return '';
         };
 
-  const text = (getText() || '').trim();
-        const remoteNumber = jidToNumber(from);
+        const text = (getText() || '').trim();
         console.log('Incoming message from', remoteNumber, '-', text);
 
         // Create a unique key per incoming message to ensure we reply at-most-once per message
